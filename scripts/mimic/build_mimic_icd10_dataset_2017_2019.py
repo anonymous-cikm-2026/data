@@ -9,11 +9,12 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 
-DEFAULT_ADMISSIONS_TABLE = "usdo_aa_catalog.research_tam_datasets.mimic_hosp_admissions"
-DEFAULT_DIAGNOSES_TABLE = "usdo_aa_catalog.research_tam_datasets.mimic_hosp_diagnoses_icd"
-DEFAULT_PATIENTS_TABLE = "usdo_aa_catalog.research_tam_datasets.mimic_hosp_patients"
-DEFAULT_NOTES_TABLE = "usdo_aa_catalog.research_tam_datasets.mimic_note_discharge"
-DEFAULT_OUTPUT_TABLE = "usdo_aa_catalog.research_tam_datasets.mimic_icd10_note_dataset_2017_2019_strict"
+DEFAULT_MIMIC_ROOT_PLACEHOLDER = Path("PUT_PATH_TO_MIMIC_IV_ROOT_HERE")
+DEFAULT_ADMISSIONS_PATH = DEFAULT_MIMIC_ROOT_PLACEHOLDER / "hosp" / "admissions.csv.gz"
+DEFAULT_DIAGNOSES_PATH = DEFAULT_MIMIC_ROOT_PLACEHOLDER / "hosp" / "diagnoses_icd.csv.gz"
+DEFAULT_PATIENTS_PATH = DEFAULT_MIMIC_ROOT_PLACEHOLDER / "hosp" / "patients.csv.gz"
+DEFAULT_NOTES_PATH = DEFAULT_MIMIC_ROOT_PLACEHOLDER / "note" / "discharge.csv.gz"
+DEFAULT_OUTPUT_PATH = Path("data/mimic/mimic_icd10_note_dataset_2017_2019_strict.parquet")
 DEFAULT_SUMMARY_PATH = Path("data/mimic/mimic_icd10_note_dataset_2017_2019_strict_summary.json")
 DEFAULT_ADDENDA_DIR = Path("data/reference-manuals/ICD-addendums")
 ADDENDA_FILENAMES = [
@@ -25,45 +26,72 @@ ADDENDA_FILENAMES = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the strict MIMIC ICD-10 note dataset for the 2017-2019 discharge-year window."
+        description=(
+            "Build the strict MIMIC ICD-10 note dataset for the 2017-2019 discharge-year window "
+            "from local MIMIC-IV CSV files."
+        ),
+        epilog=(
+            "Replace PUT_PATH_TO_MIMIC_IV_ROOT_HERE in the default input paths with the directory "
+            "that contains your local MIMIC-IV hosp/ and note/ files."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--profile", help="Databricks CLI profile to use with Databricks Connect.")
-    parser.add_argument("--cluster-id", help="Running Databricks cluster id to use with Databricks Connect.")
-    parser.add_argument("--admissions-table", default=DEFAULT_ADMISSIONS_TABLE)
-    parser.add_argument("--diagnoses-table", default=DEFAULT_DIAGNOSES_TABLE)
-    parser.add_argument("--patients-table", default=DEFAULT_PATIENTS_TABLE)
-    parser.add_argument("--notes-table", default=DEFAULT_NOTES_TABLE)
-    parser.add_argument("--output-table", default=DEFAULT_OUTPUT_TABLE)
+    parser.add_argument("--admissions-path", type=Path, default=DEFAULT_ADMISSIONS_PATH)
+    parser.add_argument("--diagnoses-path", type=Path, default=DEFAULT_DIAGNOSES_PATH)
+    parser.add_argument("--patients-path", type=Path, default=DEFAULT_PATIENTS_PATH)
+    parser.add_argument("--notes-path", type=Path, default=DEFAULT_NOTES_PATH)
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        default=DEFAULT_OUTPUT_PATH,
+        help="Path where the output parquet dataset directory will be written.",
+    )
     parser.add_argument("--addenda-dir", type=Path, default=DEFAULT_ADDENDA_DIR)
     parser.add_argument("--summary-path", type=Path, default=DEFAULT_SUMMARY_PATH)
     parser.add_argument(
         "--write-mode",
         choices=["overwrite", "errorifexists", "ignore", "append"],
         default="overwrite",
-        help="Spark write mode for the output table.",
+        help="Spark write mode for the output dataset.",
     )
     parser.add_argument(
         "--skip-write",
         action="store_true",
-        help="Run the full build and write the local summary without saving the output table.",
+        help="Run the full build and write the local summary without saving the output dataset.",
     )
     return parser.parse_args()
 
 
-def resolve_spark(profile: str | None, cluster_id: str | None):
+def resolve_spark():
     active_session = SparkSession.getActiveSession()
     if active_session is not None:
         return active_session, False
 
-    if not profile or not cluster_id:
-        raise SystemExit(
-            "Provide both --profile and --cluster-id when no active Spark session is available."
-        )
-
-    from databricks.connect import DatabricksSession
-
-    spark = DatabricksSession.builder.profile(profile).clusterId(cluster_id).getOrCreate()
+    spark = (
+        SparkSession.builder.appName("build_mimic_icd10_dataset_2017_2019")
+        .master("local[*]")
+        .config("spark.sql.session.timeZone", "UTC")
+        .getOrCreate()
+    )
     return spark, True
+
+
+def require_source_file(file_path: Path, flag_name: str) -> Path:
+    candidate = file_path.expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+
+    raise SystemExit(
+        f"Set --{flag_name} to your local MIMIC file. Replace the placeholder path "
+        f"{file_path.as_posix()} with the actual file location."
+    )
+
+
+def read_mimic_csv(spark: SparkSession, file_path: Path, *, multiline: bool = False):
+    reader = spark.read.option("header", True).option("inferSchema", True)
+    if multiline:
+        reader = reader.option("multiLine", True).option("quote", '"').option("escape", '"')
+    return reader.csv(str(file_path))
 
 
 def normalize_code(code: str) -> str:
@@ -117,19 +145,32 @@ def utc_now_iso() -> str:
 
 
 def build_dataset(args: argparse.Namespace) -> dict[str, object]:
-    spark, owns_session = resolve_spark(args.profile, args.cluster_id)
+    spark, owns_session = resolve_spark()
 
     try:
+        admissions_path = require_source_file(args.admissions_path, "admissions-path")
+        diagnoses_path = require_source_file(args.diagnoses_path, "diagnoses-path")
+        patients_path = require_source_file(args.patients_path, "patients-path")
+        notes_path = require_source_file(args.notes_path, "notes-path")
+        output_path = args.output_path.expanduser()
+
         ignore_codes = load_ignore_codes(args.addenda_dir.resolve())
         ignore_codes_df = spark.createDataFrame(
             [{"icd_code_norm": code} for code in ignore_codes]
         ).dropDuplicates(["icd_code_norm"])
 
         diagnoses_icd_df = (
-            spark.table(args.diagnoses_table)
+            read_mimic_csv(spark, diagnoses_path)
+            .select(
+                F.col("subject_id").cast("long").alias("subject_id"),
+                F.col("hadm_id").cast("long").alias("hadm_id"),
+                F.col("seq_num").cast("int").alias("seq_num"),
+                F.col("icd_code").cast("string").alias("icd_code"),
+                F.col("icd_version").cast("int").alias("icd_version"),
+            )
             .filter(F.col("icd_version") == 10)
-            .select("subject_id", "hadm_id", "seq_num", "icd_code", "icd_version")
-            .withColumn("icd_code_norm", F.upper(F.regexp_replace(F.col("icd_code"), r"\\.", "")))
+            .filter(F.col("hadm_id").isNotNull())
+            .withColumn("icd_code_norm", F.upper(F.regexp_replace(F.col("icd_code"), r"\.", "")))
         )
         hadm_ids_with_ignored_codes_df = (
             diagnoses_icd_df.join(ignore_codes_df, on="icd_code_norm", how="inner")
@@ -141,12 +182,18 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
             hadm_ids_with_ignored_codes_df, on="hadm_id", how="left_anti"
         )
 
-        patients_anchor_df = spark.table(args.patients_table).select(
-            "subject_id", "anchor_year", "anchor_year_group"
+        patients_anchor_df = read_mimic_csv(spark, patients_path).select(
+            F.col("subject_id").cast("long").alias("subject_id"),
+            F.col("anchor_year").cast("int").alias("anchor_year"),
+            F.col("anchor_year_group").cast("string").alias("anchor_year_group"),
         )
         admissions_with_anchor_df = (
-            spark.table(args.admissions_table)
-            .select("subject_id", "hadm_id", "dischtime")
+            read_mimic_csv(spark, admissions_path)
+            .select(
+                F.col("subject_id").cast("long").alias("subject_id"),
+                F.col("hadm_id").cast("long").alias("hadm_id"),
+                F.col("dischtime").cast("string").alias("dischtime"),
+            )
             .withColumn("dischtime", F.to_timestamp("dischtime"))
             .filter(F.col("dischtime").isNotNull())
             .join(patients_anchor_df, on="subject_id", how="inner")
@@ -177,8 +224,16 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
         )
 
         discharge_notes_df = (
-            spark.table(args.notes_table)
-            .select("note_id", "subject_id", "hadm_id", "note_seq", "charttime", "storetime", "text")
+            read_mimic_csv(spark, notes_path, multiline=True)
+            .select(
+                F.col("note_id").cast("string").alias("note_id"),
+                F.col("subject_id").cast("long").alias("subject_id"),
+                F.col("hadm_id").cast("long").alias("hadm_id"),
+                F.col("note_seq").cast("int").alias("note_seq"),
+                F.col("charttime").cast("string").alias("charttime"),
+                F.col("storetime").cast("string").alias("storetime"),
+                F.col("text").cast("string").alias("text"),
+            )
             .filter(F.col("hadm_id").isNotNull())
         )
         notes_per_hadm_df = discharge_notes_df.groupBy("hadm_id").agg(F.count("*").alias("n_notes"))
@@ -242,22 +297,24 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
         unique_hadm_id_count = final_df.select("hadm_id").dropDuplicates().count()
 
         if not args.skip_write:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             (
                 final_df.write.mode(args.write_mode)
-                .format("delta")
-                .saveAsTable(args.output_table)
+                .format("parquet")
+                .save(str(output_path))
             )
 
         summary = {
             "generated_at_utc": utc_now_iso(),
-            "output_table": args.output_table,
+            "output_path": str(output_path.resolve()),
+            "output_format": "parquet",
             "write_mode": args.write_mode,
-            "table_written": not args.skip_write,
-            "source_tables": {
-                "admissions": args.admissions_table,
-                "diagnoses_icd": args.diagnoses_table,
-                "patients": args.patients_table,
-                "discharge_notes": args.notes_table,
+            "dataset_written": not args.skip_write,
+            "source_files": {
+                "admissions": str(admissions_path),
+                "diagnoses_icd": str(diagnoses_path),
+                "patients": str(patients_path),
+                "discharge_notes": str(notes_path),
             },
             "addenda_dir": str(args.addenda_dir.resolve()),
             "ignore_code_count": len(ignore_codes),
