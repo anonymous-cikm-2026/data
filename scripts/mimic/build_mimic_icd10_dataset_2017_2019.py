@@ -36,10 +36,30 @@ def parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--admissions-path", type=Path, default=DEFAULT_ADMISSIONS_PATH)
-    parser.add_argument("--diagnoses-path", type=Path, default=DEFAULT_DIAGNOSES_PATH)
-    parser.add_argument("--patients-path", type=Path, default=DEFAULT_PATIENTS_PATH)
-    parser.add_argument("--notes-path", type=Path, default=DEFAULT_NOTES_PATH)
+    parser.add_argument(
+        "--admissions-path",
+        type=Path,
+        default=DEFAULT_ADMISSIONS_PATH,
+        help="Path to the local MIMIC-IV hosp/admissions.csv.gz file.",
+    )
+    parser.add_argument(
+        "--diagnoses-path",
+        type=Path,
+        default=DEFAULT_DIAGNOSES_PATH,
+        help="Path to the local MIMIC-IV hosp/diagnoses_icd.csv.gz file.",
+    )
+    parser.add_argument(
+        "--patients-path",
+        type=Path,
+        default=DEFAULT_PATIENTS_PATH,
+        help="Path to the local MIMIC-IV hosp/patients.csv.gz file.",
+    )
+    parser.add_argument(
+        "--notes-path",
+        type=Path,
+        default=DEFAULT_NOTES_PATH,
+        help="Path to the local MIMIC-IV note/discharge.csv.gz file.",
+    )
     parser.add_argument(
         "--output-path",
         type=Path,
